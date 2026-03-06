@@ -15,8 +15,10 @@ const App = () => {
   const [syncStatus, setSyncStatus] = useState('synced'); // 'synced', 'syncing', 'error'
   
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
+  
   const autoSaveTimerRef = useRef(null);
-  const isSyncingRef = useRef(false); // 保存中かどうかを管理するRef（ステート更新の競合防止）
+  const isSyncingRef = useRef(false); // 通信中かどうか
+  const hasPendingChangesRef = useRef(false); // 送信待ちの未保存入力があるかどうか
 
   // カレンダーの基本枠を生成
   const generateMonthLayout = useCallback((y, m) => {
@@ -38,11 +40,13 @@ const App = () => {
 
   // データ取得（同期）ロジック
   const fetchData = useCallback(async (isSilent = false) => {
-    // 保存処理が走っている間は、サーバーからの取得データで上書きしない
-    if (isSyncingRef.current) return;
+    // 保存処理中、または送信待ちの未保存データがある場合は、サーバーからの取得データで上書きしない
+    if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
-    if (!isSilent) setIsLoading(true);
-    setSyncStatus('syncing');
+    if (!isSilent) {
+      setIsLoading(true);
+      setSyncStatus('syncing');
+    }
     
     const baseLayout = generateMonthLayout(year, month);
 
@@ -50,8 +54,8 @@ const App = () => {
       const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
       const data = await response.json();
       
-      // 再度チェック：保存中に変わっていないか
-      if (isSyncingRef.current) return;
+      // 通信（fetch）の間に入力が発生した、あるいは保存が始まった場合は上書きを中止
+      if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
       if (data && Array.isArray(data) && data.length > 0) {
         const mergedData = baseLayout.map(dayItem => {
@@ -62,6 +66,7 @@ const App = () => {
       } else {
         setSchedule(baseLayout);
       }
+      // エラー状態からの復帰などもあるためsyncedをセット
       setSyncStatus('synced');
     } catch (error) {
       console.error("Fetch error:", error);
@@ -97,6 +102,7 @@ const App = () => {
   // サーバーへの自動保存実行
   const syncToServer = async (updatedSchedule) => {
     isSyncingRef.current = true;
+    hasPendingChangesRef.current = false; // 送信を開始するので未保存フラグを一旦下ろす
     setSyncStatus('syncing');
     try {
       const response = await fetch(GAS_URL, {
@@ -120,6 +126,8 @@ const App = () => {
 
   // 値の更新（入力と同時に同期をトリガー）
   const handleUpdate = (id, field, value) => {
+    hasPendingChangesRef.current = true; // 未保存の入力が発生したことを記録
+
     const newSchedule = schedule.map(item => 
       item.id === id ? { ...item, [field]: value } : item
     );
