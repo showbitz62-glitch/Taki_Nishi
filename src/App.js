@@ -49,9 +49,9 @@ const App = () => {
     setSyncStatus('syncing');
     try {
       const resp = await fetch(`${GAS_URL}?test=1`, { mode: 'cors' });
-      console.log("Response status:", resp.status);
       const text = await resp.text();
-      console.log("Response text sample:", text.substring(0, 100));
+      console.log("Response status:", resp.status);
+      console.log("Response text:", text);
       setSyncStatus('synced');
       setErrorMessage('');
     } catch (e) {
@@ -76,14 +76,21 @@ const App = () => {
     const baseLayout = generateMonthLayout(year, month);
 
     try {
-      // mode: 'cors' を明示
       const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`, {
         mode: 'cors'
       });
       
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       
-      const data = await response.json();
+      // JSON解析エラーを防ぐための処理
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        console.warn("Received non-JSON response from GET:", text);
+        throw new Error("Invalid data format from server");
+      }
       
       if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
@@ -151,7 +158,20 @@ const App = () => {
       });
       
       if (!response.ok) throw new Error(`Post failed: ${response.status}`);
-      const result = await response.json();
+      
+      const text = await response.text();
+      let result;
+      try {
+        result = JSON.parse(text);
+      } catch (e) {
+        // もしGASが "Success" という文字列だけを返してきた場合も、成功とみなす
+        if (text.includes("Success") || text.includes("success")) {
+          result = { status: 'success' };
+        } else {
+          console.warn("GAS returned non-JSON text:", text);
+          throw new Error("Server response was not JSON");
+        }
+      }
       
       if (result.status === 'success') {
         if (timestamp >= lastSentTimestampRef.current) {
@@ -250,7 +270,7 @@ const App = () => {
               ) : syncStatus === 'error' ? (
                 <>
                   <AlertCircle className="text-rose-400" size={14} />
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（タップでテスト）</span>
+                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（解析失敗）</span>
                 </>
               ) : (
                 <>
