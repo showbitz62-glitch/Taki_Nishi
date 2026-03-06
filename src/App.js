@@ -140,16 +140,16 @@ const App = () => {
 
         <div className="glass-panel rounded-[2rem] shadow-2xl border border-white/5 overflow-hidden">
           <div className="grid grid-cols-12 bg-white/[0.03] border-b border-white/5 text-[9px] font-black tracking-[0.2em] text-slate-500 uppercase">
-            <div className="col-span-2 py-5 text-center">Reference</div>
+            <div className="col-span-2 py-5 text-center">日付</div>
             <div className="col-span-3 py-5 px-4 flex items-center gap-3 justify-center">
               <User size={12} className="text-blue-400/50" />
-              <span>Taki</span>
+              <span>瀧</span>
             </div>
             <div className="col-span-3 py-5 px-4 flex items-center gap-3 justify-center">
               <UserRound size={12} className="text-pink-400/50" />
-              <span>Nishi</span>
+              <span>西</span>
             </div>
-            <div className="col-span-4 py-5 text-center">Status Notes</div>
+            <div className="col-span-4 py-5 text-center">メモ</div>
           </div>
 
           <div className="divide-y divide-white/5 relative">
