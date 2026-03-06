@@ -39,10 +39,11 @@ const handleSave = async () => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-  year: year,
-  month: currentMonth.replace('月',''),
-  schedule: schedule
-})
+        year: year,
+        month: currentMonth.replace("月", ""),
+        schedule: schedule
+      })
+    });
 
     alert("同期が完了しました！");
   } catch (err) {
