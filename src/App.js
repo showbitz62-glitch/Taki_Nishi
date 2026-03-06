@@ -29,26 +29,27 @@ const App = () => {
       });
   }, []);
 
-  // 2. 変更があったデータを1件ずつ保存する（GASの仕様に合わせた簡易実装）
-  const handleSave = async () => {
-    setIsSaving(true);
-    try {
-      // データの数だけ順番に更新（もっと効率的な方法もありますが、まずは確実に）
-      for (const item of schedule) {
-        await fetch(GAS_URL, {
-          method: "POST",
-          mode: "no-cors", // GASのCORS制限回避
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(item)
-        });
-      }
-      alert("同期が完了しました！");
-    } catch (err) {
-      alert("保存中にエラーが発生しました。");
-    } finally {
-      setIsSaving(false);
-    }
-  };
+const handleSave = async () => {
+  setIsSaving(true);
+
+  try {
+    await fetch(GAS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        schedule: schedule
+      })
+    });
+
+    alert("同期が完了しました！");
+  } catch (err) {
+    alert("保存中にエラーが発生しました");
+  } finally {
+    setIsSaving(false);
+  }
+};
 
   const statusOptions = [
     { value: '', label: '-', sub: '未設定', color: 'border-slate-800 text-slate-500 bg-slate-900/50' },
