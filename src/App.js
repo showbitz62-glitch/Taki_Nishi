@@ -16,6 +16,7 @@ const App = () => {
   
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
   const autoSaveTimerRef = useRef(null);
+  const isSyncingRef = useRef(false); // 保存中かどうかを管理するRef（ステート更新の競合防止）
 
   // カレンダーの基本枠を生成
   const generateMonthLayout = useCallback((y, m) => {
@@ -37,6 +38,9 @@ const App = () => {
 
   // データ取得（同期）ロジック
   const fetchData = useCallback(async (isSilent = false) => {
+    // 保存処理が走っている間は、サーバーからの取得データで上書きしない
+    if (isSyncingRef.current) return;
+
     if (!isSilent) setIsLoading(true);
     setSyncStatus('syncing');
     
@@ -46,6 +50,9 @@ const App = () => {
       const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
       const data = await response.json();
       
+      // 再度チェック：保存中に変わっていないか
+      if (isSyncingRef.current) return;
+
       if (data && Array.isArray(data) && data.length > 0) {
         const mergedData = baseLayout.map(dayItem => {
           const savedItem = data.find(d => Number(d.date) === dayItem.date);
@@ -89,6 +96,7 @@ const App = () => {
 
   // サーバーへの自動保存実行
   const syncToServer = async (updatedSchedule) => {
+    isSyncingRef.current = true;
     setSyncStatus('syncing');
     try {
       const response = await fetch(GAS_URL, {
@@ -105,6 +113,8 @@ const App = () => {
     } catch (error) {
       console.error("Sync error:", error);
       setSyncStatus('error');
+    } finally {
+      isSyncingRef.current = false;
     }
   };
 
@@ -115,11 +125,11 @@ const App = () => {
     );
     setSchedule(newSchedule);
 
-    // デバウンス処理：短時間の連続入力を防ぎ、最後に変更してから500ms後に送信
+    // デバウンス処理：短時間の連続入力を防ぎ、最後に変更してから800ms後に送信
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
       syncToServer(newSchedule);
-    }, 500);
+    }, 800);
   };
 
   const statusOptions = [
