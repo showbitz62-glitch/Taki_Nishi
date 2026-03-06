@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
-  Save, ChevronLeft, ChevronRight, 
-  Calendar as CalendarIcon, Loader2, CheckCircle2, AlertCircle,
-  Clock, MessageSquare
+  ChevronLeft, ChevronRight, 
+  Loader2, CheckCircle2, AlertCircle,
+  MessageSquare, RefreshCw
 } from 'lucide-react';
 
 const GAS_URL = "https://script.google.com/macros/s/AKfycbzAafyy_l_0P2oqQM5MQbvkgCUSDkAwm42Zf2Cn5NAyFhjk6y61aThKCqxwHfShDkb0/exec";
@@ -12,14 +12,13 @@ const App = () => {
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [schedule, setSchedule] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-  const [message, setMessage] = useState({ text: '', type: '' });
-
+  const [syncStatus, setSyncStatus] = useState('synced'); // 'synced', 'syncing', 'error'
+  
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
+  const autoSaveTimerRef = useRef(null);
 
-  // 指定された年月の正しい日数を計算し、初期レイアウトを生成する
+  // カレンダーの基本枠を生成
   const generateMonthLayout = useCallback((y, m) => {
-    // 日に「0」を指定することで、その前月（＝指定したい月）の最終日を取得できる
     const lastDay = new Date(y, m, 0).getDate();
     const arr = [];
     for (let i = 1; i <= lastDay; i++) {
@@ -36,38 +35,43 @@ const App = () => {
     return arr;
   }, []);
 
-  // データ取得ロジック
-  useEffect(() => {
-    const fetchData = async () => {
-      setIsLoading(true);
-      
-      // 1. まず、選択された年月に基づいて真っさらな月の日付リストを作成
-      const newLayout = generateMonthLayout(year, month);
-      setSchedule(newLayout);
+  // データ取得（同期）ロジック
+  const fetchData = useCallback(async (isSilent = false) => {
+    if (!isSilent) setIsLoading(true);
+    setSyncStatus('syncing');
+    
+    const baseLayout = generateMonthLayout(year, month);
 
-      try {
-        const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
-        const data = await response.json();
-        
-        // 2. サーバーからデータが返ってきた場合、その月のデータで上書きする
-        // サーバー側のデータが現在の日数と異なる可能性を考慮し、マッピングして統合
-        if (data && data.length > 0) {
-          setSchedule(prev => {
-            return prev.map(dayItem => {
-              const savedItem = data.find(d => d.date === dayItem.date);
-              return savedItem ? { ...dayItem, ...savedItem } : dayItem;
-            });
-          });
-        }
-      } catch (error) {
-        console.error("Fetch error:", error);
-        // エラー時は初期レイアウト（newLayout）がそのまま使われる
-      } finally {
-        setIsLoading(false);
+    try {
+      const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
+      const data = await response.json();
+      
+      if (data && Array.isArray(data) && data.length > 0) {
+        const mergedData = baseLayout.map(dayItem => {
+          const savedItem = data.find(d => Number(d.date) === dayItem.date);
+          return savedItem ? { ...dayItem, ...savedItem } : dayItem;
+        });
+        setSchedule(mergedData);
+      } else {
+        setSchedule(baseLayout);
       }
-    };
-    fetchData();
+      setSyncStatus('synced');
+    } catch (error) {
+      console.error("Fetch error:", error);
+      setSyncStatus('error');
+      if (!isSilent) setSchedule(baseLayout);
+    } finally {
+      if (!isSilent) setIsLoading(false);
+    }
   }, [year, month, generateMonthLayout]);
+
+  // 初回読み込みと、定期的な同期（ポーリング）の設定
+  useEffect(() => {
+    fetchData();
+    // 5秒ごとにバックグラウンドで同期
+    const interval = setInterval(() => fetchData(true), 5000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
   const changeMonth = (offset) => {
     let newMonth = month + offset;
@@ -83,27 +87,39 @@ const App = () => {
     setMonth(newMonth);
   };
 
-  const handleSave = async () => {
-    setIsSaving(true);
-    setMessage({ text: '', type: '' });
+  // サーバーへの自動保存実行
+  const syncToServer = async (updatedSchedule) => {
+    setSyncStatus('syncing');
     try {
       const response = await fetch(GAS_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ year, month, schedule })
+        body: JSON.stringify({ year, month, schedule: updatedSchedule })
       });
       const result = await response.json();
       if (result.status === 'success') {
-        setMessage({ text: 'クラウドに保存しました', type: 'success' });
+        setSyncStatus('synced');
       } else {
         throw new Error();
       }
     } catch (error) {
-      setMessage({ text: 'エラーが発生しました', type: 'error' });
-    } finally {
-      setIsSaving(false);
-      setTimeout(() => setMessage({ text: '', type: '' }), 3000);
+      console.error("Sync error:", error);
+      setSyncStatus('error');
     }
+  };
+
+  // 値の更新（入力と同時に同期をトリガー）
+  const handleUpdate = (id, field, value) => {
+    const newSchedule = schedule.map(item => 
+      item.id === id ? { ...item, [field]: value } : item
+    );
+    setSchedule(newSchedule);
+
+    // デバウンス処理：短時間の連続入力を防ぎ、最後に変更してから500ms後に送信
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = setTimeout(() => {
+      syncToServer(newSchedule);
+    }, 500);
   };
 
   const statusOptions = [
@@ -113,10 +129,6 @@ const App = () => {
     { value: 'ADJUST', label: '△', sub: '要相談', color: 'bg-amber-500/10 text-amber-400 border-amber-500/20' },
     { value: 'NG', label: '×', sub: '不可', color: 'bg-rose-500/10 text-rose-400 border-rose-500/20' },
   ];
-
-  const handleUpdate = (id, field, value) => {
-    setSchedule(prev => prev.map(item => item.id === id ? { ...item, [field]: value } : item));
-  };
 
   const isMatched = (taki, nishi) => {
     const ok = ['OK_HOLIDAY', 'OK_WORK'];
@@ -161,34 +173,28 @@ const App = () => {
               </div>
             </div>
 
-            <button
-              onClick={handleSave}
-              disabled={isSaving}
-              className={`group relative flex items-center gap-2 px-6 py-3 rounded-2xl font-bold transition-all active:scale-95 overflow-hidden ${
-                isSaving 
-                ? 'bg-slate-800 text-slate-500' 
-                : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-[0_0_20px_rgba(79,70,229,0.4)]'
-              }`}
-            >
-              {isSaving ? <Loader2 className="animate-spin" size={18} /> : <Save size={18} />}
-              <span className="relative z-10">{isSaving ? '保存中' : '保存'}</span>
-            </button>
-          </div>
-
-          {/* Toast Message */}
-          {message.text && (
-            <div className={`mt-4 flex items-center gap-2 p-3 rounded-xl text-sm animate-in fade-in zoom-in duration-300 ${
-              message.type === 'success' 
-              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
-              : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-            }`}>
-              {message.type === 'success' ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
-              {message.text}
+            {/* Sync Indicator */}
+            <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700">
+              {syncStatus === 'syncing' ? (
+                <>
+                  <RefreshCw className="animate-spin text-indigo-400" size={14} />
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Syncing...</span>
+                </>
+              ) : syncStatus === 'error' ? (
+                <>
+                  <AlertCircle className="text-rose-400" size={14} />
+                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">Sync Error</span>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="text-emerald-400" size={14} />
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Synced</span>
+                </>
+              )}
             </div>
-          )}
+          </div>
         </div>
 
-        {/* Column Labels */}
         <div className="grid grid-cols-12 gap-3 mt-6 px-6 text-[10px] font-black text-slate-500 uppercase tracking-widest">
           <div className="col-span-2">Date</div>
           <div className="col-span-3 text-center">TAKI</div>
@@ -197,7 +203,6 @@ const App = () => {
         </div>
       </div>
 
-      {/* Main List Area */}
       <div className="max-w-2xl mx-auto px-4 pb-24 space-y-3 mt-2">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-32 text-slate-500 gap-4">
@@ -222,7 +227,6 @@ const App = () => {
                   : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
                 }`}
               >
-                {/* Date Display */}
                 <div className={`col-span-2 flex flex-col items-center justify-center leading-none ${
                   isSun ? 'text-rose-400' : isSat ? 'text-sky-400' : 'text-slate-400'
                 }`}>
@@ -230,13 +234,12 @@ const App = () => {
                   <span className="text-[10px] font-bold mt-1 opacity-60 tracking-tighter">{item.day}</span>
                 </div>
 
-                {/* Taki Select */}
                 <div className="col-span-3 relative group">
                   <select
-                    value={item.taki}
+                    value={item.taki || ''}
                     onChange={(e) => handleUpdate(item.id, 'taki', e.target.value)}
                     className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold focus:ring-2 focus:ring-indigo-500/50 transition-all appearance-none cursor-pointer ${
-                      statusOptions.find(o => o.value === item.taki)?.color
+                      statusOptions.find(o => o.value === (item.taki || ''))?.color
                     }`}
                   >
                     {statusOptions.map(o => (
@@ -247,13 +250,12 @@ const App = () => {
                   </select>
                 </div>
 
-                {/* Nishi Select */}
                 <div className="col-span-3 relative">
                   <select
-                    value={item.nishi}
+                    value={item.nishi || ''}
                     onChange={(e) => handleUpdate(item.id, 'nishi', e.target.value)}
                     className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold focus:ring-2 focus:ring-indigo-500/50 transition-all appearance-none cursor-pointer ${
-                      statusOptions.find(o => o.value === item.nishi)?.color
+                      statusOptions.find(o => o.value === (item.nishi || ''))?.color
                     }`}
                   >
                     {statusOptions.map(o => (
@@ -264,14 +266,13 @@ const App = () => {
                   </select>
                 </div>
 
-                {/* Memo Input */}
                 <div className="col-span-4 relative group">
                   <div className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 group-focus-within:text-indigo-400 transition-colors">
                     <MessageSquare size={14} />
                   </div>
                   <input
                     type="text"
-                    value={item.memo}
+                    value={item.memo || ''}
                     onChange={(e) => handleUpdate(item.id, 'memo', e.target.value)}
                     placeholder="備忘録..."
                     className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl text-xs pl-9 pr-3 py-2.5 focus:bg-slate-800 focus:border-indigo-500/50 focus:ring-0 transition-all placeholder:text-slate-600 text-slate-200"
@@ -283,7 +284,6 @@ const App = () => {
         )}
       </div>
 
-      {/* Floating Match Count */}
       {!isLoading && schedule.some(i => isMatched(i.taki, i.nishi)) && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30">
           <div className="bg-indigo-600 text-white px-5 py-2 rounded-full shadow-2xl flex items-center gap-2 border border-white/10 backdrop-blur-md">
