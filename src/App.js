@@ -5,7 +5,7 @@ import {
   MessageSquare, RefreshCw
 } from 'lucide-react';
 
-// ※ GASのURLが正しいか、末尾にスペースなどが入っていないか再度ご確認ください
+// ※ 新しくデプロイしたGASのURLに差し替えてください
 const GAS_URL = "https://script.google.com/macros/s/AKfycbzAafyy_l_0P2oqQM5MQbvkgCUSDkAwm42Zf2Cn5NAyFhjk6y61aThKCqxwHfShDkb0/exec";
 
 const App = () => {
@@ -21,11 +21,9 @@ const App = () => {
   const autoSaveTimerRef = useRef(null);
   const isSyncingRef = useRef(false); 
   const hasPendingChangesRef = useRef(false); 
-  const lastSyncTimeRef = useRef(0);
   const lastSentTimestampRef = useRef(0);
   const retryCountRef = useRef(0);
 
-  // カレンダーの初期レイアウト生成
   const generateMonthLayout = useCallback((y, m) => {
     const lastDay = new Date(y, m, 0).getDate();
     const arr = [];
@@ -43,30 +41,9 @@ const App = () => {
     return arr;
   }, []);
 
-  // 接続テスト用
-  const testConnection = async () => {
-    console.log("Testing connection to GAS...");
-    setSyncStatus('syncing');
-    try {
-      const resp = await fetch(`${GAS_URL}?test=1`, { mode: 'cors' });
-      const text = await resp.text();
-      console.log("Response status:", resp.status);
-      console.log("Response text:", text);
-      setSyncStatus('synced');
-      setErrorMessage('');
-    } catch (e) {
-      console.error("Connection Test Failed:", e);
-      setSyncStatus('error');
-      setErrorMessage(e.message);
-    }
-  };
-
-  // データ取得ロジック
   const fetchData = useCallback(async (isSilent = false) => {
+    // 同期中または未保存の変更がある場合は自動取得をスキップして入力を保護
     if (isSyncingRef.current || hasPendingChangesRef.current) return;
-
-    const now = Date.now();
-    if (isSilent && now - lastSyncTimeRef.current < 5000) return;
 
     if (!isSilent) {
       setIsLoading(true);
@@ -82,35 +59,33 @@ const App = () => {
       
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       
-      // JSON解析エラーを防ぐための処理
-      const text = await response.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        console.warn("Received non-JSON response from GET:", text);
-        throw new Error("Invalid data format from server");
-      }
+      const data = await response.json();
       
-      if (isSyncingRef.current || hasPendingChangesRef.current) return;
+      // 取得中にユーザーが入力した場合は上書きしない
+      if (hasPendingChangesRef.current) return;
 
       if (data && Array.isArray(data) && data.length > 0) {
         const mergedData = baseLayout.map(dayItem => {
-          const savedItem = data.find(d => Number(d.date) === dayItem.date);
-          return savedItem ? { ...dayItem, ...savedItem } : dayItem;
+          const savedItem = data.find(d => Number(d.date) === Number(dayItem.date));
+          return savedItem ? { 
+            ...dayItem, 
+            taki: savedItem.taki || '', 
+            nishi: savedItem.nishi || '', 
+            memo: savedItem.memo || '' 
+          } : dayItem;
         });
         setSchedule(mergedData);
         setSyncStatus('synced');
         setErrorMessage('');
-      } else if (!isSilent) {
+      } else {
         setSchedule(baseLayout);
         setSyncStatus('synced');
       }
     } catch (error) {
-      console.error("Fetch error details:", error);
+      console.error("Fetch error:", error);
       if (!isSilent) {
         setSyncStatus('error');
-        setErrorMessage(error.message);
+        setErrorMessage("データの取得に失敗しました");
       }
     } finally {
       if (!isSilent) setIsLoading(false);
@@ -119,11 +94,15 @@ const App = () => {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(() => fetchData(true), 10000);
+    const interval = setInterval(() => fetchData(true), 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
   const changeMonth = (offset) => {
+    if (hasPendingChangesRef.current) {
+      const confirm = window.confirm("未保存の変更があります。移動しますか？");
+      if (!confirm) return;
+    }
     let newMonth = month + offset;
     let newYear = year;
     if (newMonth > 12) {
@@ -133,11 +112,11 @@ const App = () => {
       newMonth = 12;
       newYear--;
     }
+    hasPendingChangesRef.current = false;
     setYear(newYear);
     setMonth(newMonth);
   };
 
-  // サーバー保存処理
   const syncToServer = async (updatedSchedule, timestamp) => {
     if (timestamp < lastSentTimestampRef.current) return;
     
@@ -152,51 +131,32 @@ const App = () => {
         body: JSON.stringify({ 
           year, 
           month, 
-          schedule: updatedSchedule,
-          timestamp: timestamp 
+          schedule: updatedSchedule
         })
       });
       
-      if (!response.ok) throw new Error(`Post failed: ${response.status}`);
-      
-      const text = await response.text();
-      let result;
-      try {
-        result = JSON.parse(text);
-      } catch (e) {
-        // もしGASが "Success" という文字列だけを返してきた場合も、成功とみなす
-        if (text.includes("Success") || text.includes("success")) {
-          result = { status: 'success' };
-        } else {
-          console.warn("GAS returned non-JSON text:", text);
-          throw new Error("Server response was not JSON");
-        }
-      }
+      const result = await response.json();
       
       if (result.status === 'success') {
+        // 保存成功
         if (timestamp >= lastSentTimestampRef.current) {
-          lastSyncTimeRef.current = Date.now();
           hasPendingChangesRef.current = false;
           setSyncStatus('synced');
           setErrorMessage('');
           retryCountRef.current = 0;
         }
       } else {
-        throw new Error(result.message || "GAS execution error");
+        throw new Error(result.message || "GASエラー");
       }
     } catch (error) {
-      console.error("Sync error details:", error);
+      console.error("Sync error:", error);
       setSyncStatus('error');
-      setErrorMessage(error.message);
-      hasPendingChangesRef.current = true;
-
+      setErrorMessage("保存に失敗しました。再試行中...");
+      
+      // 自動リトライ
       if (retryCountRef.current < 3) {
         retryCountRef.current++;
-        setTimeout(() => {
-          if (hasPendingChangesRef.current) {
-            syncToServer(updatedSchedule, timestamp);
-          }
-        }, 3000 * retryCountRef.current);
+        setTimeout(() => syncToServer(updatedSchedule, timestamp), 3000);
       }
     } finally {
       isSyncingRef.current = false;
@@ -205,6 +165,7 @@ const App = () => {
 
   const handleUpdate = (id, field, value) => {
     hasPendingChangesRef.current = true;
+    setSyncStatus('syncing');
 
     const newSchedule = schedule.map(item => 
       item.id === id ? { ...item, [field]: value } : item
@@ -217,7 +178,7 @@ const App = () => {
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
       syncToServer(newSchedule, timestamp);
-    }, 1500);
+    }, 2000); // 入力停止から2秒後に保存
   };
 
   const statusOptions = [
@@ -234,55 +195,48 @@ const App = () => {
   };
 
   return (
-    <div className="min-h-screen bg-[#0f172a] text-slate-200 font-sans selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-[#0f172a] text-slate-200 font-sans">
+      {/* Header */}
       <div className="max-w-2xl mx-auto sticky top-0 z-20 px-4 pt-6 pb-2">
         <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-3xl p-4 shadow-2xl">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="flex items-center bg-slate-800 rounded-xl p-1">
-                <button onClick={() => changeMonth(-1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90">
+                <button onClick={() => changeMonth(-1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors">
                   <ChevronLeft size={20} className="text-slate-400" />
                 </button>
                 <div className="px-3 flex flex-col items-center min-w-[80px]">
-                  <span className="text-[10px] font-bold text-slate-500 tracking-[0.2em] uppercase">{year}</span>
-                  <div className="relative flex items-center">
-                    <span className="text-lg font-black text-white">{month}月</span>
-                    <select value={month} onChange={(e) => setMonth(parseInt(e.target.value))} className="absolute inset-0 opacity-0 cursor-pointer w-full">
-                      {[...Array(12)].map((_, i) => (<option key={i + 1} value={i + 1}>{i + 1}月</option>))}
-                    </select>
-                  </div>
+                  <span className="text-[10px] font-bold text-slate-500 tracking-widest">{year}</span>
+                  <span className="text-lg font-black text-white">{month}月</span>
                 </div>
-                <button onClick={() => changeMonth(1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90">
+                <button onClick={() => changeMonth(1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors">
                   <ChevronRight size={20} className="text-slate-400" />
                 </button>
               </div>
             </div>
 
-            <button 
-              onClick={syncStatus === 'error' ? testConnection : undefined}
-              className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700 hover:bg-slate-800 transition-colors"
-            >
+            <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700">
               {syncStatus === 'syncing' ? (
                 <>
                   <RefreshCw className="animate-spin text-indigo-400" size={14} />
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">同期中...</span>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">同期中...</span>
                 </>
               ) : syncStatus === 'error' ? (
                 <>
                   <AlertCircle className="text-rose-400" size={14} />
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（解析失敗）</span>
+                  <span className="text-[10px] font-bold text-rose-400 uppercase">保存エラー</span>
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="text-emerald-400" size={14} />
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">保存済み</span>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">保存済み</span>
                 </>
               )}
-            </button>
+            </div>
           </div>
           {errorMessage && (
-            <div className="mt-2 px-2 py-1 text-[10px] text-rose-400/70 font-mono truncate text-center">
-              Error: {errorMessage}
+            <div className="mt-2 text-center text-[10px] text-rose-400 font-medium">
+              {errorMessage}
             </div>
           )}
         </div>
@@ -295,11 +249,12 @@ const App = () => {
         </div>
       </div>
 
+      {/* Main Content */}
       <div className="max-w-2xl mx-auto px-4 pb-24 space-y-3 mt-2">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-32 text-slate-500 gap-4">
             <Loader2 className="animate-spin" size={40} />
-            <p className="text-sm tracking-widest font-medium uppercase">Initializing...</p>
+            <p className="text-sm tracking-widest font-medium uppercase">Loading Data...</p>
           </div>
         ) : (
           schedule.map((item) => {
@@ -314,14 +269,22 @@ const App = () => {
                   <span className="text-[10px] font-bold mt-1 opacity-60 tracking-tighter">{item.day}</span>
                 </div>
 
-                <div className="col-span-3 relative group">
-                  <select value={item.taki || ''} onChange={(e) => handleUpdate(item.id, 'taki', e.target.value)} className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.taki || ''))?.color}`}>
+                <div className="col-span-3">
+                  <select 
+                    value={item.taki || ''} 
+                    onChange={(e) => handleUpdate(item.id, 'taki', e.target.value)} 
+                    className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.taki || ''))?.color}`}
+                  >
                     {statusOptions.map(o => (<option key={o.value} value={o.value} className="bg-slate-900 text-white">{o.label} {o.sub}</option>))}
                   </select>
                 </div>
 
-                <div className="col-span-3 relative">
-                  <select value={item.nishi || ''} onChange={(e) => handleUpdate(item.id, 'nishi', e.target.value)} className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.nishi || ''))?.color}`}>
+                <div className="col-span-3">
+                  <select 
+                    value={item.nishi || ''} 
+                    onChange={(e) => handleUpdate(item.id, 'nishi', e.target.value)} 
+                    className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.nishi || ''))?.color}`}
+                  >
                     {statusOptions.map(o => (<option key={o.value} value={o.value} className="bg-slate-900 text-white">{o.label} {o.sub}</option>))}
                   </select>
                 </div>
@@ -330,7 +293,13 @@ const App = () => {
                   <div className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 group-focus-within:text-indigo-400 transition-colors">
                     <MessageSquare size={14} />
                   </div>
-                  <input type="text" value={item.memo || ''} onChange={(e) => handleUpdate(item.id, 'memo', e.target.value)} placeholder="..." className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl text-xs pl-9 pr-3 py-2.5 focus:bg-slate-800 focus:border-indigo-500/50 transition-all placeholder:text-slate-600 text-slate-200" />
+                  <input 
+                    type="text" 
+                    value={item.memo || ''} 
+                    onChange={(e) => handleUpdate(item.id, 'memo', e.target.value)} 
+                    placeholder="..." 
+                    className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl text-xs pl-9 pr-3 py-2.5 focus:bg-slate-800 focus:border-indigo-500/50 transition-all placeholder:text-slate-600 text-slate-200" 
+                  />
                 </div>
               </div>
             );
@@ -338,6 +307,7 @@ const App = () => {
         )}
       </div>
 
+      {/* Floating Status Bar */}
       {!isLoading && schedule.some(i => isMatched(i.taki, i.nishi)) && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30">
           <div className="bg-indigo-600 text-white px-5 py-2 rounded-full shadow-2xl flex items-center gap-2 border border-white/10 backdrop-blur-md">
