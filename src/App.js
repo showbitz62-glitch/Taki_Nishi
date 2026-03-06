@@ -5,6 +5,7 @@ import {
   MessageSquare, RefreshCw
 } from 'lucide-react';
 
+// ※ GASのURLが正しいか、末尾にスペースなどが入っていないか再度ご確認ください
 const GAS_URL = "https://script.google.com/macros/s/AKfycbzAafyy_l_0P2oqQM5MQbvkgCUSDkAwm42Zf2Cn5NAyFhjk6y61aThKCqxwHfShDkb0/exec";
 
 const App = () => {
@@ -13,6 +14,7 @@ const App = () => {
   const [schedule, setSchedule] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [syncStatus, setSyncStatus] = useState('synced'); // 'synced', 'syncing', 'error'
+  const [errorMessage, setErrorMessage] = useState('');
   
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
   
@@ -41,12 +43,28 @@ const App = () => {
     return arr;
   }, []);
 
+  // 接続テスト用
+  const testConnection = async () => {
+    console.log("Testing connection to GAS...");
+    setSyncStatus('syncing');
+    try {
+      const resp = await fetch(`${GAS_URL}?test=1`, { mode: 'cors' });
+      console.log("Response status:", resp.status);
+      const text = await resp.text();
+      console.log("Response text sample:", text.substring(0, 100));
+      setSyncStatus('synced');
+      setErrorMessage('');
+    } catch (e) {
+      console.error("Connection Test Failed:", e);
+      setSyncStatus('error');
+      setErrorMessage(e.message);
+    }
+  };
+
   // データ取得ロジック
   const fetchData = useCallback(async (isSilent = false) => {
-    // 送信中、または未送信の入力がある場合は絶対に上書きしない
     if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
-    // 保存成功後、GAS側の反映ラグを考慮して5秒間は同期をスキップ
     const now = Date.now();
     if (isSilent && now - lastSyncTimeRef.current < 5000) return;
 
@@ -58,11 +76,15 @@ const App = () => {
     const baseLayout = generateMonthLayout(year, month);
 
     try {
-      const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
-      if (!response.ok) throw new Error("Fetch failed");
+      // mode: 'cors' を明示
+      const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`, {
+        mode: 'cors'
+      });
+      
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      
       const data = await response.json();
       
-      // 通信中にユーザーが入力を開始した場合は、取得結果を捨てる
       if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
       if (data && Array.isArray(data) && data.length > 0) {
@@ -72,14 +94,17 @@ const App = () => {
         });
         setSchedule(mergedData);
         setSyncStatus('synced');
+        setErrorMessage('');
       } else if (!isSilent) {
         setSchedule(baseLayout);
         setSyncStatus('synced');
       }
     } catch (error) {
-      console.error("Fetch error:", error);
-      // サイレント更新での失敗はステータスを変えない（ユーザーを不安にさせない）
-      if (!isSilent) setSyncStatus('error');
+      console.error("Fetch error details:", error);
+      if (!isSilent) {
+        setSyncStatus('error');
+        setErrorMessage(error.message);
+      }
     } finally {
       if (!isSilent) setIsLoading(false);
     }
@@ -87,7 +112,7 @@ const App = () => {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(() => fetchData(true), 8000);
+    const interval = setInterval(() => fetchData(true), 10000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -105,7 +130,7 @@ const App = () => {
     setMonth(newMonth);
   };
 
-  // サーバー保存処理（リトライ機能付き）
+  // サーバー保存処理
   const syncToServer = async (updatedSchedule, timestamp) => {
     if (timestamp < lastSentTimestampRef.current) return;
     
@@ -115,6 +140,7 @@ const App = () => {
     try {
       const response = await fetch(GAS_URL, {
         method: 'POST',
+        mode: 'cors',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({ 
           year, 
@@ -124,7 +150,7 @@ const App = () => {
         })
       });
       
-      if (!response.ok) throw new Error("Network error");
+      if (!response.ok) throw new Error(`Post failed: ${response.status}`);
       const result = await response.json();
       
       if (result.status === 'success') {
@@ -132,26 +158,25 @@ const App = () => {
           lastSyncTimeRef.current = Date.now();
           hasPendingChangesRef.current = false;
           setSyncStatus('synced');
-          retryCountRef.current = 0; // リトライ回数リセット
+          setErrorMessage('');
+          retryCountRef.current = 0;
         }
       } else {
-        throw new Error(result.message || "Lock failed");
+        throw new Error(result.message || "GAS execution error");
       }
     } catch (error) {
-      console.error("Sync error:", error);
+      console.error("Sync error details:", error);
       setSyncStatus('error');
+      setErrorMessage(error.message);
       hasPendingChangesRef.current = true;
 
-      // エラー時（特にロック失敗）は最大5回まで自動リトライ
-      if (retryCountRef.current < 5) {
+      if (retryCountRef.current < 3) {
         retryCountRef.current++;
-        const delay = 2000 * retryCountRef.current; // 指数関数的な待機
-        console.log(`Retrying in ${delay}ms... (Attempt ${retryCountRef.current})`);
         setTimeout(() => {
           if (hasPendingChangesRef.current) {
             syncToServer(updatedSchedule, timestamp);
           }
-        }, delay);
+        }, 3000 * retryCountRef.current);
       }
     } finally {
       isSyncingRef.current = false;
@@ -172,7 +197,7 @@ const App = () => {
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
       syncToServer(newSchedule, timestamp);
-    }, 1500); // サーバー負荷とロック競合を避けるため少し余裕を持たせる
+    }, 1500);
   };
 
   const statusOptions = [
@@ -213,7 +238,10 @@ const App = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700">
+            <button 
+              onClick={syncStatus === 'error' ? testConnection : undefined}
+              className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700 hover:bg-slate-800 transition-colors"
+            >
               {syncStatus === 'syncing' ? (
                 <>
                   <RefreshCw className="animate-spin text-indigo-400" size={14} />
@@ -222,7 +250,7 @@ const App = () => {
               ) : syncStatus === 'error' ? (
                 <>
                   <AlertCircle className="text-rose-400" size={14} />
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（再送待機）</span>
+                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（タップでテスト）</span>
                 </>
               ) : (
                 <>
@@ -230,8 +258,13 @@ const App = () => {
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">保存済み</span>
                 </>
               )}
-            </div>
+            </button>
           </div>
+          {errorMessage && (
+            <div className="mt-2 px-2 py-1 text-[10px] text-rose-400/70 font-mono truncate text-center">
+              Error: {errorMessage}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-12 gap-3 mt-6 px-6 text-[10px] font-black text-slate-500 uppercase tracking-widest">
