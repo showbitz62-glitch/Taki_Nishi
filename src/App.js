@@ -21,6 +21,7 @@ const App = () => {
   const hasPendingChangesRef = useRef(false); 
   const lastSyncTimeRef = useRef(0);
   const lastSentTimestampRef = useRef(0);
+  const retryCountRef = useRef(0);
 
   // カレンダーの初期レイアウト生成
   const generateMonthLayout = useCallback((y, m) => {
@@ -64,8 +65,6 @@ const App = () => {
       // 通信中にユーザーが入力を開始した場合は、取得結果を捨てる
       if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
-      // 重要: GASからデータが1件も返ってこない場合は、スプレッドシートが空かエラーの可能性があるため上書きしない
-      // (ただし、初回ロード時のみは初期レイアウトを表示する)
       if (data && Array.isArray(data) && data.length > 0) {
         const mergedData = baseLayout.map(dayItem => {
           const savedItem = data.find(d => Number(d.date) === dayItem.date);
@@ -74,22 +73,21 @@ const App = () => {
         setSchedule(mergedData);
         setSyncStatus('synced');
       } else if (!isSilent) {
-        // 全くデータがない新規シートの場合
         setSchedule(baseLayout);
         setSyncStatus('synced');
       }
     } catch (error) {
       console.error("Fetch error:", error);
-      setSyncStatus('error');
+      // サイレント更新での失敗はステータスを変えない（ユーザーを不安にさせない）
+      if (!isSilent) setSyncStatus('error');
     } finally {
       if (!isSilent) setIsLoading(false);
     }
   }, [year, month, generateMonthLayout]);
 
-  // 初回ロードと定期取得
   useEffect(() => {
     fetchData();
-    const interval = setInterval(() => fetchData(true), 7000); // 負荷軽減のため7秒間隔
+    const interval = setInterval(() => fetchData(true), 8000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -107,8 +105,10 @@ const App = () => {
     setMonth(newMonth);
   };
 
-  // サーバー保存処理
+  // サーバー保存処理（リトライ機能付き）
   const syncToServer = async (updatedSchedule, timestamp) => {
+    if (timestamp < lastSentTimestampRef.current) return;
+    
     isSyncingRef.current = true;
     setSyncStatus('syncing');
     
@@ -123,31 +123,42 @@ const App = () => {
           timestamp: timestamp 
         })
       });
+      
+      if (!response.ok) throw new Error("Network error");
       const result = await response.json();
       
       if (result.status === 'success') {
-        // 最後に送信したリクエストの応答であるかを確認
         if (timestamp >= lastSentTimestampRef.current) {
-          lastSentTimestampRef.current = timestamp;
           lastSyncTimeRef.current = Date.now();
-          hasPendingChangesRef.current = false; // ここで初めて「保存済み」にする
+          hasPendingChangesRef.current = false;
           setSyncStatus('synced');
+          retryCountRef.current = 0; // リトライ回数リセット
         }
       } else {
-        throw new Error(result.message);
+        throw new Error(result.message || "Lock failed");
       }
     } catch (error) {
       console.error("Sync error:", error);
       setSyncStatus('error');
-      // エラー時は hasPendingChangesRef を true のままにし、次回の自動取得で上書きされるのを防ぐ
       hasPendingChangesRef.current = true;
+
+      // エラー時（特にロック失敗）は最大5回まで自動リトライ
+      if (retryCountRef.current < 5) {
+        retryCountRef.current++;
+        const delay = 2000 * retryCountRef.current; // 指数関数的な待機
+        console.log(`Retrying in ${delay}ms... (Attempt ${retryCountRef.current})`);
+        setTimeout(() => {
+          if (hasPendingChangesRef.current) {
+            syncToServer(updatedSchedule, timestamp);
+          }
+        }, delay);
+      }
     } finally {
       isSyncingRef.current = false;
     }
   };
 
   const handleUpdate = (id, field, value) => {
-    // 入力が始まった瞬間に上書きをロック
     hasPendingChangesRef.current = true;
 
     const newSchedule = schedule.map(item => 
@@ -161,7 +172,7 @@ const App = () => {
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
       syncToServer(newSchedule, timestamp);
-    }, 1200);
+    }, 1500); // サーバー負荷とロック競合を避けるため少し余裕を持たせる
   };
 
   const statusOptions = [
@@ -211,7 +222,7 @@ const App = () => {
               ) : syncStatus === 'error' ? (
                 <>
                   <AlertCircle className="text-rose-400" size={14} />
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー</span>
+                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー（再送待機）</span>
                 </>
               ) : (
                 <>
