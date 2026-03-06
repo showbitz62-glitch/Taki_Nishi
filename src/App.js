@@ -17,8 +17,9 @@ const App = () => {
 
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
 
-  // 月のレイアウトを生成する関数
+  // 指定された年月の正しい日数を計算し、初期レイアウトを生成する
   const generateMonthLayout = useCallback((y, m) => {
+    // 日に「0」を指定することで、その前月（＝指定したい月）の最終日を取得できる
     const lastDay = new Date(y, m, 0).getDate();
     const arr = [];
     for (let i = 1; i <= lastDay; i++) {
@@ -39,20 +40,28 @@ const App = () => {
   useEffect(() => {
     const fetchData = async () => {
       setIsLoading(true);
-      // 月を切り替えた瞬間に古いデータをクリアして新しい月の枠組みを表示する
-      setSchedule(generateMonthLayout(year, month));
+      
+      // 1. まず、選択された年月に基づいて真っさらな月の日付リストを作成
+      const newLayout = generateMonthLayout(year, month);
+      setSchedule(newLayout);
 
       try {
         const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
         const data = await response.json();
         
-        // 取得したデータが現在の選択年月に合致する場合のみセット
+        // 2. サーバーからデータが返ってきた場合、その月のデータで上書きする
+        // サーバー側のデータが現在の日数と異なる可能性を考慮し、マッピングして統合
         if (data && data.length > 0) {
-          setSchedule(data);
+          setSchedule(prev => {
+            return prev.map(dayItem => {
+              const savedItem = data.find(d => d.date === dayItem.date);
+              return savedItem ? { ...dayItem, ...savedItem } : dayItem;
+            });
+          });
         }
       } catch (error) {
         console.error("Fetch error:", error);
-        // エラー時は初期レイアウトのまま（既にセット済み）
+        // エラー時は初期レイアウト（newLayout）がそのまま使われる
       } finally {
         setIsLoading(false);
       }
@@ -206,7 +215,7 @@ const App = () => {
 
             return (
               <div 
-                key={`${year}-${month}-${item.id}`} 
+                key={`${year}-${month}-${item.date}`} 
                 className={`grid grid-cols-12 gap-3 p-3 items-center rounded-2xl border transition-all duration-300 ${
                   matched 
                   ? 'bg-indigo-600/10 border-indigo-500/50 shadow-[0_0_15px_rgba(79,70,229,0.15)]' 
