@@ -17,11 +17,12 @@ const App = () => {
   const daysJP = ['日', '月', '火', '水', '木', '金', '土'];
   
   const autoSaveTimerRef = useRef(null);
-  const isSyncingRef = useRef(false); // 通信中かどうか
-  const hasPendingChangesRef = useRef(false); // 送信待ちの未保存入力があるかどうか
-  const lastSyncTimeRef = useRef(0); // 最後に保存が完了した時刻
+  const isSyncingRef = useRef(false); 
+  const hasPendingChangesRef = useRef(false); 
+  const lastSyncTimeRef = useRef(0);
+  const lastSentTimestampRef = useRef(0);
 
-  // カレンダーの基本枠を生成
+  // カレンダーの初期レイアウト生成
   const generateMonthLayout = useCallback((y, m) => {
     const lastDay = new Date(y, m, 0).getDate();
     const arr = [];
@@ -39,15 +40,14 @@ const App = () => {
     return arr;
   }, []);
 
-  // データ取得（同期）ロジック
+  // データ取得ロジック
   const fetchData = useCallback(async (isSilent = false) => {
-    // 1. 保存処理中、または送信待ちの未保存データがある場合は上書きしない
+    // 送信中、または未送信の入力がある場合は絶対に上書きしない
     if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
-    // 2. 保存完了直後（3秒以内）は、サーバー側の反映待ちのため同期をスキップする
-    // これにより、GAS側の古いキャッシュや反映遅延によるデータの巻き戻りを防ぐ
+    // 保存成功後、GAS側の反映ラグを考慮して5秒間は同期をスキップ
     const now = Date.now();
-    if (isSilent && now - lastSyncTimeRef.current < 3000) return;
+    if (isSilent && now - lastSyncTimeRef.current < 5000) return;
 
     if (!isSilent) {
       setIsLoading(true);
@@ -58,34 +58,38 @@ const App = () => {
 
     try {
       const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
+      if (!response.ok) throw new Error("Fetch failed");
       const data = await response.json();
       
-      // 通信中に入力が発生した場合は、その入力を優先するため上書きを中止
+      // 通信中にユーザーが入力を開始した場合は、取得結果を捨てる
       if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
+      // 重要: GASからデータが1件も返ってこない場合は、スプレッドシートが空かエラーの可能性があるため上書きしない
+      // (ただし、初回ロード時のみは初期レイアウトを表示する)
       if (data && Array.isArray(data) && data.length > 0) {
         const mergedData = baseLayout.map(dayItem => {
           const savedItem = data.find(d => Number(d.date) === dayItem.date);
           return savedItem ? { ...dayItem, ...savedItem } : dayItem;
         });
         setSchedule(mergedData);
-      } else {
+        setSyncStatus('synced');
+      } else if (!isSilent) {
+        // 全くデータがない新規シートの場合
         setSchedule(baseLayout);
+        setSyncStatus('synced');
       }
-      setSyncStatus('synced');
     } catch (error) {
       console.error("Fetch error:", error);
       setSyncStatus('error');
-      if (!isSilent) setSchedule(baseLayout);
     } finally {
       if (!isSilent) setIsLoading(false);
     }
   }, [year, month, generateMonthLayout]);
 
-  // 初回読み込みと、定期的な同期（ポーリング）の設定
+  // 初回ロードと定期取得
   useEffect(() => {
     fetchData();
-    const interval = setInterval(() => fetchData(true), 5000);
+    const interval = setInterval(() => fetchData(true), 7000); // 負荷軽減のため7秒間隔
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -103,34 +107,47 @@ const App = () => {
     setMonth(newMonth);
   };
 
-  // サーバーへの自動保存実行
-  const syncToServer = async (updatedSchedule) => {
+  // サーバー保存処理
+  const syncToServer = async (updatedSchedule, timestamp) => {
     isSyncingRef.current = true;
-    hasPendingChangesRef.current = false;
     setSyncStatus('syncing');
+    
     try {
       const response = await fetch(GAS_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ year, month, schedule: updatedSchedule })
+        body: JSON.stringify({ 
+          year, 
+          month, 
+          schedule: updatedSchedule,
+          timestamp: timestamp 
+        })
       });
       const result = await response.json();
+      
       if (result.status === 'success') {
-        lastSyncTimeRef.current = Date.now(); // 成功時刻を記録
-        setSyncStatus('synced');
+        // 最後に送信したリクエストの応答であるかを確認
+        if (timestamp >= lastSentTimestampRef.current) {
+          lastSentTimestampRef.current = timestamp;
+          lastSyncTimeRef.current = Date.now();
+          hasPendingChangesRef.current = false; // ここで初めて「保存済み」にする
+          setSyncStatus('synced');
+        }
       } else {
-        throw new Error();
+        throw new Error(result.message);
       }
     } catch (error) {
       console.error("Sync error:", error);
       setSyncStatus('error');
+      // エラー時は hasPendingChangesRef を true のままにし、次回の自動取得で上書きされるのを防ぐ
+      hasPendingChangesRef.current = true;
     } finally {
       isSyncingRef.current = false;
     }
   };
 
-  // 値の更新（入力と同時に同期をトリガー）
   const handleUpdate = (id, field, value) => {
+    // 入力が始まった瞬間に上書きをロック
     hasPendingChangesRef.current = true;
 
     const newSchedule = schedule.map(item => 
@@ -138,10 +155,13 @@ const App = () => {
     );
     setSchedule(newSchedule);
 
+    const timestamp = Date.now();
+    lastSentTimestampRef.current = timestamp;
+
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
-      syncToServer(newSchedule);
-    }, 800);
+      syncToServer(newSchedule, timestamp);
+    }, 1200);
   };
 
   const statusOptions = [
@@ -164,31 +184,19 @@ const App = () => {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="flex items-center bg-slate-800 rounded-xl p-1">
-                <button 
-                  onClick={() => changeMonth(-1)} 
-                  className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90"
-                >
+                <button onClick={() => changeMonth(-1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90">
                   <ChevronLeft size={20} className="text-slate-400" />
                 </button>
                 <div className="px-3 flex flex-col items-center min-w-[80px]">
                   <span className="text-[10px] font-bold text-slate-500 tracking-[0.2em] uppercase">{year}</span>
                   <div className="relative flex items-center">
                     <span className="text-lg font-black text-white">{month}月</span>
-                    <select 
-                      value={month} 
-                      onChange={(e) => setMonth(parseInt(e.target.value))}
-                      className="absolute inset-0 opacity-0 cursor-pointer w-full"
-                    >
-                      {[...Array(12)].map((_, i) => (
-                        <option key={i + 1} value={i + 1}>{i + 1}月</option>
-                      ))}
+                    <select value={month} onChange={(e) => setMonth(parseInt(e.target.value))} className="absolute inset-0 opacity-0 cursor-pointer w-full">
+                      {[...Array(12)].map((_, i) => (<option key={i + 1} value={i + 1}>{i + 1}月</option>))}
                     </select>
                   </div>
                 </div>
-                <button 
-                  onClick={() => changeMonth(1)} 
-                  className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90"
-                >
+                <button onClick={() => changeMonth(1)} className="p-2 hover:bg-slate-700 rounded-lg transition-colors active:scale-90">
                   <ChevronRight size={20} className="text-slate-400" />
                 </button>
               </div>
@@ -198,17 +206,17 @@ const App = () => {
               {syncStatus === 'syncing' ? (
                 <>
                   <RefreshCw className="animate-spin text-indigo-400" size={14} />
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Syncing...</span>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">同期中...</span>
                 </>
               ) : syncStatus === 'error' ? (
                 <>
                   <AlertCircle className="text-rose-400" size={14} />
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">Sync Error</span>
+                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-tighter">同期エラー</span>
                 </>
               ) : (
                 <>
                   <CheckCircle2 className="text-emerald-400" size={14} />
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">Synced</span>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">保存済み</span>
                 </>
               )}
             </div>
@@ -216,21 +224,18 @@ const App = () => {
         </div>
 
         <div className="grid grid-cols-12 gap-3 mt-6 px-6 text-[10px] font-black text-slate-500 uppercase tracking-widest">
-          <div className="col-span-2">Date</div>
+          <div className="col-span-2">日付</div>
           <div className="col-span-3 text-center">TAKI</div>
           <div className="col-span-3 text-center">NISHI</div>
-          <div className="col-span-4 pl-2">Note</div>
+          <div className="col-span-4 pl-2">備考</div>
         </div>
       </div>
 
       <div className="max-w-2xl mx-auto px-4 pb-24 space-y-3 mt-2">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-32 text-slate-500 gap-4">
-            <div className="relative">
-                <div className="absolute inset-0 blur-xl bg-indigo-500/20 rounded-full animate-pulse"></div>
-                <Loader2 className="animate-spin relative z-10" size={40} />
-            </div>
-            <p className="text-sm tracking-widest font-medium">SYNCHRONIZING...</p>
+            <Loader2 className="animate-spin" size={40} />
+            <p className="text-sm tracking-widest font-medium uppercase">Initializing...</p>
           </div>
         ) : (
           schedule.map((item) => {
@@ -239,50 +244,21 @@ const App = () => {
             const isSun = item.day === '日';
 
             return (
-              <div 
-                key={`${year}-${month}-${item.date}`} 
-                className={`grid grid-cols-12 gap-3 p-3 items-center rounded-2xl border transition-all duration-300 ${
-                  matched 
-                  ? 'bg-indigo-600/10 border-indigo-500/50 shadow-[0_0_15px_rgba(79,70,229,0.15)]' 
-                  : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
-                }`}
-              >
-                <div className={`col-span-2 flex flex-col items-center justify-center leading-none ${
-                  isSun ? 'text-rose-400' : isSat ? 'text-sky-400' : 'text-slate-400'
-                }`}>
+              <div key={`${year}-${month}-${item.date}`} className={`grid grid-cols-12 gap-3 p-3 items-center rounded-2xl border transition-all duration-300 ${matched ? 'bg-indigo-600/10 border-indigo-500/50 shadow-[0_0_15px_rgba(79,70,229,0.15)]' : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'}`}>
+                <div className={`col-span-2 flex flex-col items-center justify-center leading-none ${isSun ? 'text-rose-400' : isSat ? 'text-sky-400' : 'text-slate-400'}`}>
                   <span className="text-xl font-black">{item.date}</span>
                   <span className="text-[10px] font-bold mt-1 opacity-60 tracking-tighter">{item.day}</span>
                 </div>
 
                 <div className="col-span-3 relative group">
-                  <select
-                    value={item.taki || ''}
-                    onChange={(e) => handleUpdate(item.id, 'taki', e.target.value)}
-                    className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold focus:ring-2 focus:ring-indigo-500/50 transition-all appearance-none cursor-pointer ${
-                      statusOptions.find(o => o.value === (item.taki || ''))?.color
-                    }`}
-                  >
-                    {statusOptions.map(o => (
-                      <option key={o.value} value={o.value} className="bg-slate-900 text-white">
-                        {o.label} {o.sub}
-                      </option>
-                    ))}
+                  <select value={item.taki || ''} onChange={(e) => handleUpdate(item.id, 'taki', e.target.value)} className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.taki || ''))?.color}`}>
+                    {statusOptions.map(o => (<option key={o.value} value={o.value} className="bg-slate-900 text-white">{o.label} {o.sub}</option>))}
                   </select>
                 </div>
 
                 <div className="col-span-3 relative">
-                  <select
-                    value={item.nishi || ''}
-                    onChange={(e) => handleUpdate(item.id, 'nishi', e.target.value)}
-                    className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold focus:ring-2 focus:ring-indigo-500/50 transition-all appearance-none cursor-pointer ${
-                      statusOptions.find(o => o.value === (item.nishi || ''))?.color
-                    }`}
-                  >
-                    {statusOptions.map(o => (
-                      <option key={o.value} value={o.value} className="bg-slate-900 text-white">
-                        {o.label} {o.sub}
-                      </option>
-                    ))}
+                  <select value={item.nishi || ''} onChange={(e) => handleUpdate(item.id, 'nishi', e.target.value)} className={`w-full text-center py-2.5 rounded-xl border text-xs font-bold transition-all appearance-none cursor-pointer ${statusOptions.find(o => o.value === (item.nishi || ''))?.color}`}>
+                    {statusOptions.map(o => (<option key={o.value} value={o.value} className="bg-slate-900 text-white">{o.label} {o.sub}</option>))}
                   </select>
                 </div>
 
@@ -290,13 +266,7 @@ const App = () => {
                   <div className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 group-focus-within:text-indigo-400 transition-colors">
                     <MessageSquare size={14} />
                   </div>
-                  <input
-                    type="text"
-                    value={item.memo || ''}
-                    onChange={(e) => handleUpdate(item.id, 'memo', e.target.value)}
-                    placeholder="備忘録..."
-                    className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl text-xs pl-9 pr-3 py-2.5 focus:bg-slate-800 focus:border-indigo-500/50 focus:ring-0 transition-all placeholder:text-slate-600 text-slate-200"
-                  />
+                  <input type="text" value={item.memo || ''} onChange={(e) => handleUpdate(item.id, 'memo', e.target.value)} placeholder="..." className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl text-xs pl-9 pr-3 py-2.5 focus:bg-slate-800 focus:border-indigo-500/50 transition-all placeholder:text-slate-600 text-slate-200" />
                 </div>
               </div>
             );
@@ -308,9 +278,7 @@ const App = () => {
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30">
           <div className="bg-indigo-600 text-white px-5 py-2 rounded-full shadow-2xl flex items-center gap-2 border border-white/10 backdrop-blur-md">
             <CheckCircle2 size={16} />
-            <span className="text-xs font-bold tracking-tight">
-              {schedule.filter(i => isMatched(i.taki, i.nishi)).length}日間 合致しています
-            </span>
+            <span className="text-xs font-bold tracking-tight">{schedule.filter(i => isMatched(i.taki, i.nishi)).length}日間 合致しています</span>
           </div>
         </div>
       )}
