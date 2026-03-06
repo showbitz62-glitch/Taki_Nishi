@@ -19,6 +19,7 @@ const App = () => {
   const autoSaveTimerRef = useRef(null);
   const isSyncingRef = useRef(false); // 通信中かどうか
   const hasPendingChangesRef = useRef(false); // 送信待ちの未保存入力があるかどうか
+  const lastSyncTimeRef = useRef(0); // 最後に保存が完了した時刻
 
   // カレンダーの基本枠を生成
   const generateMonthLayout = useCallback((y, m) => {
@@ -40,8 +41,13 @@ const App = () => {
 
   // データ取得（同期）ロジック
   const fetchData = useCallback(async (isSilent = false) => {
-    // 保存処理中、または送信待ちの未保存データがある場合は、サーバーからの取得データで上書きしない
+    // 1. 保存処理中、または送信待ちの未保存データがある場合は上書きしない
     if (isSyncingRef.current || hasPendingChangesRef.current) return;
+
+    // 2. 保存完了直後（3秒以内）は、サーバー側の反映待ちのため同期をスキップする
+    // これにより、GAS側の古いキャッシュや反映遅延によるデータの巻き戻りを防ぐ
+    const now = Date.now();
+    if (isSilent && now - lastSyncTimeRef.current < 3000) return;
 
     if (!isSilent) {
       setIsLoading(true);
@@ -54,7 +60,7 @@ const App = () => {
       const response = await fetch(`${GAS_URL}?year=${year}&month=${month}`);
       const data = await response.json();
       
-      // 通信（fetch）の間に入力が発生した、あるいは保存が始まった場合は上書きを中止
+      // 通信中に入力が発生した場合は、その入力を優先するため上書きを中止
       if (isSyncingRef.current || hasPendingChangesRef.current) return;
 
       if (data && Array.isArray(data) && data.length > 0) {
@@ -66,7 +72,6 @@ const App = () => {
       } else {
         setSchedule(baseLayout);
       }
-      // エラー状態からの復帰などもあるためsyncedをセット
       setSyncStatus('synced');
     } catch (error) {
       console.error("Fetch error:", error);
@@ -80,7 +85,6 @@ const App = () => {
   // 初回読み込みと、定期的な同期（ポーリング）の設定
   useEffect(() => {
     fetchData();
-    // 5秒ごとにバックグラウンドで同期
     const interval = setInterval(() => fetchData(true), 5000);
     return () => clearInterval(interval);
   }, [fetchData]);
@@ -102,7 +106,7 @@ const App = () => {
   // サーバーへの自動保存実行
   const syncToServer = async (updatedSchedule) => {
     isSyncingRef.current = true;
-    hasPendingChangesRef.current = false; // 送信を開始するので未保存フラグを一旦下ろす
+    hasPendingChangesRef.current = false;
     setSyncStatus('syncing');
     try {
       const response = await fetch(GAS_URL, {
@@ -112,6 +116,7 @@ const App = () => {
       });
       const result = await response.json();
       if (result.status === 'success') {
+        lastSyncTimeRef.current = Date.now(); // 成功時刻を記録
         setSyncStatus('synced');
       } else {
         throw new Error();
@@ -126,14 +131,13 @@ const App = () => {
 
   // 値の更新（入力と同時に同期をトリガー）
   const handleUpdate = (id, field, value) => {
-    hasPendingChangesRef.current = true; // 未保存の入力が発生したことを記録
+    hasPendingChangesRef.current = true;
 
     const newSchedule = schedule.map(item => 
       item.id === id ? { ...item, [field]: value } : item
     );
     setSchedule(newSchedule);
 
-    // デバウンス処理：短時間の連続入力を防ぎ、最後に変更してから800ms後に送信
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = setTimeout(() => {
       syncToServer(newSchedule);
@@ -155,7 +159,6 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-[#0f172a] text-slate-200 font-sans selection:bg-indigo-500/30">
-      {/* Header Container */}
       <div className="max-w-2xl mx-auto sticky top-0 z-20 px-4 pt-6 pb-2">
         <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-3xl p-4 shadow-2xl">
           <div className="flex items-center justify-between">
@@ -191,7 +194,6 @@ const App = () => {
               </div>
             </div>
 
-            {/* Sync Indicator */}
             <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-slate-800/50 border border-slate-700">
               {syncStatus === 'syncing' ? (
                 <>
